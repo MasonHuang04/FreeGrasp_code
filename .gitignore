@@ -7,6 +7,9 @@
 logs*
 npz_file*
 output*
+# data sets
 data/demo*
-
+rsr/data/
+rsr/vendor/
+rsr_case.csv
 *.parquet
