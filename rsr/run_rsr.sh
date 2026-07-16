@@ -7,8 +7,22 @@ cd "$ROOT_DIR"
 # API evaluation is intentionally direct. Model loading uses the public cache
 # in offline mode, so inherited proxy variables are not needed.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+# Keep user-level packages from shadowing the pinned freegrasp environment
+# (for example ~/.local/einops 0.4.1 lacks Molmo's required einsum helper).
+export PYTHONNOUSERSITE=1
 
-PYTHON="${PYTHON:-/home/qiuguanhe/miniconda3/envs/freegrasp/bin/python}"
+if [[ -z "${PYTHON:-}" ]]; then
+    for candidate in \
+        "$HOME/anaconda3/envs/freegrasp/bin/python" \
+        "$HOME/miniconda3/envs/freegrasp/bin/python" \
+        /home/qiuguanhe/miniconda3/envs/freegrasp/bin/python; do
+        if [[ -x "$candidate" ]]; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+PYTHON="${PYTHON:-}"
 if [[ ! -x "$PYTHON" ]]; then
     echo "Python environment not found: $PYTHON" >&2
     exit 1
@@ -33,7 +47,15 @@ export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
 # HF_HOME/HF_HUB_CACHE above without emitting legacy-cache warnings.
 unset TRANSFORMERS_CACHE PYTORCH_TRANSFORMERS_CACHE PYTORCH_PRETRAINED_BERT_CACHE
 export HF_MODULES_CACHE="$HF_HOME/modules"
-export TORCH_HOME="${TORCH_HOME:-/home/data/models/torch}"
+if [[ -z "${TORCH_HOME:-}" ]]; then
+    for candidate in "$HOME/.cache/torch" /home/data/models/torch; do
+        if [[ -f "$candidate/hub/checkpoints/sam_vit_h_4b8939.pth" ]]; then
+            TORCH_HOME="$candidate"
+            break
+        fi
+    done
+fi
+export TORCH_HOME="${TORCH_HOME:-$HOME/.cache/torch}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 exec "$PYTHON" -u -m rsr.run "$@"

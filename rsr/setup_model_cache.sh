@@ -21,20 +21,46 @@ link_directory() {
     ln -sfn "$source" "$destination"
 }
 
-# Molmo is complete in the legacy shared cache. GroundingDINO and BERT are
-# complete in the newer shared cache. Expose both through one rsr-local cache
-# view without copying any model weights or modifying the public directories.
-link_directory \
+find_directory() {
+    local label="$1"
+    shift
+    local candidate
+    for candidate in "$@"; do
+        if [[ -n "$candidate" && -e "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "Required public model cache is missing: $label" >&2
+    return 1
+}
+
+# Discover complete public caches on either lab account, then expose them
+# through one rsr-local symlink view. No model files are copied or modified.
+MOLMO_CACHE="$(find_directory Molmo \
+    "${RSR_MOLMO_CACHE_DIR:-}" \
+    "$HOME/.cache/huggingface/hub/models--allenai--Molmo-7B-D-0924" \
     /home/data/models/huggingface/hub/models--allenai--Molmo-7B-D-0924 \
-    "$HUB_ROOT/models--allenai--Molmo-7B-D-0924"
-link_directory \
+    /home/data/datasets/.cache/hf/models--allenai--Molmo-7B-D-0924)"
+DINO_CACHE="$(find_directory GroundingDINO \
+    "${RSR_DINO_CACHE_DIR:-}" \
+    "$HOME/.cache/huggingface/hub/models--ShilongLiu--GroundingDINO" \
     /home/data/datasets/.cache/hf/models--ShilongLiu--GroundingDINO \
-    "$HUB_ROOT/models--ShilongLiu--GroundingDINO"
-link_directory \
+    /home/data/models/huggingface/hub/models--ShilongLiu--GroundingDINO)"
+BERT_CACHE="$(find_directory bert-base-uncased \
+    "${RSR_BERT_CACHE_DIR:-}" \
+    "$HOME/.cache/huggingface/hub/models--bert-base-uncased" \
     /home/data/datasets/.cache/hf/models--bert-base-uncased \
-    "$HUB_ROOT/models--bert-base-uncased"
-link_directory \
+    /home/data/models/huggingface/hub/models--bert-base-uncased)"
+MODULES_CACHE="$(find_directory HuggingFace-modules \
+    "${RSR_HF_MODULES_DIR:-}" \
+    "$HOME/.cache/huggingface/modules" \
     /home/data/models/huggingface/modules \
-    "$CACHE_ROOT/modules"
+    /home/data/datasets/.cache/hf/modules)"
+
+link_directory "$MOLMO_CACHE" "$HUB_ROOT/models--allenai--Molmo-7B-D-0924"
+link_directory "$DINO_CACHE" "$HUB_ROOT/models--ShilongLiu--GroundingDINO"
+link_directory "$BERT_CACHE" "$HUB_ROOT/models--bert-base-uncased"
+link_directory "$MODULES_CACHE" "$CACHE_ROOT/modules"
 
 mkdir -p "$HUB_ROOT/.locks"

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-import io
 import json
 import os
 import subprocess
@@ -25,30 +24,30 @@ from .common import (
     read_json,
     write_json,
 )
-from .metrics import DEFAULT_IOU_THRESHOLD, score_prediction_mask
+from .metrics import (
+    DEFAULT_IOU_THRESHOLD,
+    GroundTruthMaskError,
+    score_prediction_against_gt_files,
+)
 from .segmentation import SegmentationInfrastructureError, predict_object_mask
 
 
 MOLMO_PROMPT = "Point out all objects in the green tray"
 LOCALIZATION_MODES = ("gt", "molmo")
 RELAY_BASE_URL = "https://www.highland-api.top/v1"
-MAX_API_REQUEST_BYTES = 900_000
+MAX_API_REQUEST_BYTES = 8_000_000
+FREEGRASP_REQUEST_PROFILE = "original_freegrasp_request_v1"
 
 FREEGRASP_SYSTEM_PROMPT = (
-    "You are a robotic system for bin picking, using a parallel gripper. "
-    "I labeled all objects id in the image.\n\n"
-    "You have two possible actions:\n"
-    "1. remove obstacle, object_id: This action moves the specified object out of the way "
-    "so it does not interfere with grasping the desired target object. This action can only "
-    "be performed if the specified object is free of obstacles (not occluded by any other object).\n"
-    "2. pick object, object_id: This action picks up the specified object. It can only be "
-    "performed if the object is free of obstacles.\n"
-    "An object is considered an obstacle if it occludes another object.\n\n"
-    "Task: Given a target object description as input, determine the first object that needs "
-    "to be grasped to enable picking the target object. If the target object is free of obstacles, "
-    "return the target object ID itself. Otherwise, identify an object that is occluding the target "
-    "and is itself free of obstacles. If multiple objects could be removed, return any one valid option.\n\n"
-    "Output Format: The output should only be the object ID of the first object to grasp, "
+    "You are a robotic system for bin picking, using a parallel gripper. I labeled all objects id in the image."
+    "You have two possible actions:"
+    "1. remove obstacle, object_id: This action moves the specified object out of the way so it does not interfere with grasping the desired target object. This action can only be performed if the specified object is free of obstacles (not occluded by any other object)."
+    "2. pick object, object_id: This action picks up the specified object. It can only be performed if the object is free of obstacles."
+    "An object is considered an obstacle if it occludes another object."
+    "Task:"
+    "Given a target object description as input, determine the first object that needs to be grasped to enable picking the target object. If the target object is free of obstacles, return the target object ID itself. Otherwise, identify an object that is occluding the target and is itself free of obstacles. If multiple objects could be removed, return any one valid option."
+    "Output Format:"
+    "The output should only be the object ID of the first object to grasp, "
     "must formatted as: [object_id, color class_name]\n"
 )
 
@@ -62,6 +61,7 @@ CSV_FIELDS = (
     "split",
     "annotation",
     "model",
+    "api_response_model",
     "api_transport",
     "api_base_url",
     "localization_mode",
@@ -74,6 +74,7 @@ CSV_FIELDS = (
     "point_x",
     "point_y",
     "predicted_mask",
+    "ground_truth_mask_manifest",
     "iou",
     "ssr",
     "rsr",
@@ -139,7 +140,25 @@ def run_molmo_scene(
     )
     if result_path.exists() and labeled_image_path.exists() and id_text_path.exists() and not force:
         print(f"[molmo cached] scene={scene_id}", flush=True)
-        return read_json(result_path)
+        payload = read_json(result_path)
+        if payload.get("labeled_image_style") != "freegrasp_matplotlib":
+            # Older rsr outputs replaced FreeGrasp's Matplotlib artifact with
+            # a smaller opaque-label PIL image. Restore the original visual
+            # prompt from cached points without running Molmo again.
+            image = Image.open(scene_dir / "image.png").convert("RGB")
+            _save_freegrasp_matplotlib_png(
+                image,
+                payload.get("points", []),
+                labeled_image_path,
+            )
+            payload["labeled_image_style"] = "freegrasp_matplotlib"
+            payload["labeled_image_restored_without_molmo_rerun"] = True
+            write_json(result_path, payload)
+            print(
+                f"[molmo label restored] scene={scene_id} style=freegrasp_matplotlib",
+                flush=True,
+            )
+        return payload
     if force:
         # A failed fresh localization must not leave an older localization
         # available for the reasoning stage.
@@ -171,9 +190,6 @@ def run_molmo_scene(
 
     molmo_eval.OUTPUT_DIR = str(output_root / "localization" / "molmo")
     molmo_eval.save_results(scene_id, image, points, mapping)
-    # The official helper uses a large Matplotlib canvas. Keep the rsr upload
-    # artifact at the original scene resolution while preserving PNG encoding.
-    _save_numbered_png(image, point_records, labeled_image_path)
     payload = {
         "schema_version": 1,
         "scene_id": scene_id,
@@ -181,6 +197,7 @@ def run_molmo_scene(
         "prompt": MOLMO_PROMPT,
         "points": point_records,
         "labeled_image": str(labeled_image_path.resolve()),
+        "labeled_image_style": "freegrasp_matplotlib",
         "id_text": str(id_text_path.resolve()),
         "elapsed_seconds": round(time.time() - started, 3),
         "mapping_definition": "predicted_object_id = instances_objects[y, x] - 1",
@@ -227,22 +244,85 @@ def _save_numbered_png(image: Image.Image, points: list[dict[str, Any]], path: P
     labeled.save(path, format="PNG", optimize=True)
 
 
-def _encode_image_like_smartgrasp(source: Path) -> tuple[str, dict[str, Any]]:
-    """Match SmartGrasp: in-memory RGB JPEG quality 90, then Base64."""
-    with Image.open(source) as opened:
-        image = opened.convert("RGB")
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=90)
-    encoded = buffer.getvalue()
+def _save_freegrasp_matplotlib_png(
+    image: Image.Image,
+    points: list[dict[str, Any]],
+    path: Path,
+) -> None:
+    """Reproduce FreeGrasp's original Matplotlib numbered PNG."""
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(10, 8))
+    plt.imshow(image)
+    for point in points:
+        plt.text(
+            int(point["x"]),
+            int(point["y"]),
+            int(point["localization_id"]),
+            color="yellow",
+            fontsize=8,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            bbox={"facecolor": "black", "alpha": 0.5, "edgecolor": "none"},
+        )
+    plt.axis("off")
+    plt.savefig(path, bbox_inches="tight", pad_inches=0, dpi=300)
+    plt.close()
+
+
+def _encode_original_png(source: Path) -> tuple[str, dict[str, Any]]:
+    """Upload the exact FreeGrasp Matplotlib PNG bytes without conversion."""
+    encoded = source.read_bytes()
+    with Image.open(source) as image:
+        source_format = image.format
+        size = list(image.size)
+        mode = image.mode
+    if source_format != "PNG":
+        raise ValueError(f"Expected a PNG visual prompt, got {source_format}: {source}")
     return base64.b64encode(encoded).decode("utf-8"), {
         "source": str(source.resolve()),
-        "source_format": "PNG",
-        "transport_format": "JPEG",
-        "jpeg_quality": 90,
-        "size": list(image.size),
+        "source_format": source_format,
+        "transport_format": "PNG",
+        "size": size,
+        "mode": mode,
         "encoded_image_bytes": len(encoded),
-        "persisted_to_disk": False,
-        "detail": "high",
+        "transport_uses_source_bytes": True,
+        "resized": False,
+        "recompressed": False,
+    }
+
+
+def _freegrasp_chat_payload(
+    model: str,
+    instruction: str,
+    base64_image: str,
+) -> dict[str, Any]:
+    """Build the original FreeGrasp Chat Completions payload exactly."""
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": FREEGRASP_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Grasp {instruction}"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}",
+                        },
+                    },
+                ],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 713,
+        "top_p": 1,
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+        "seed": 0,
     }
 
 
@@ -501,7 +581,10 @@ def _api_cache_matches(
         or cached.get("annotation") != instruction
         or cached.get("localization_mode") != localization_mode
         or cached.get("model") != model
+        or cached.get("request_profile") != FREEGRASP_REQUEST_PROFILE
         or not isinstance(cached.get("upload_image"), dict)
+        or cached["upload_image"].get("transport_format") != "PNG"
+        or cached["upload_image"].get("transport_uses_source_bytes") is not True
     ):
         return False
 
@@ -529,6 +612,7 @@ def run_reason_case(
     localization_mode: str,
     model: str,
     iou_threshold: float,
+    compute_metrics: bool,
     force: bool,
     fresh: bool,
     api_max_attempts: int,
@@ -552,13 +636,31 @@ def run_reason_case(
         # previous final result, mask, or intermediate API response may leak in.
         for path in (result_path, predicted_mask_path, api_result_path):
             path.unlink(missing_ok=True)
+        for path in result_path.parent.glob(
+            f"split_{split}_ground_truth_mask_object_*.png"
+        ):
+            path.unlink(missing_ok=True)
     if result_path.exists() and not force:
         cached = read_json(result_path)
-        if (
-            cached.get("model") == model
+        cached_computed = (
+            cached.get("ground_truth_compared") is True
             and cached.get("iou_threshold") == float(iou_threshold)
             and cached.get("ssr") is not None
             and cached.get("rsr") is not None
+        )
+        cached_manual = (
+            cached.get("ground_truth_compared") is False
+            and cached.get("metric_status") == "manual_review_required"
+            and cached.get("ssr") is None
+            and cached.get("rsr") is None
+        )
+        if (
+            cached.get("model") == model
+            and cached.get("request_profile") == FREEGRASP_REQUEST_PROFILE
+            and (
+                (compute_metrics and cached_computed)
+                or (not compute_metrics and cached_manual)
+            )
         ):
             print(
                 f"[reason cached] mode={localization_mode} scene={scene_id} split={split}",
@@ -615,48 +717,22 @@ def run_reason_case(
         api_attempts = int(cached_api.get("api_attempts") or 0)
         api_transport = cached_api.get("api_transport", client.transport_name)
         api_base_url = cached_api.get("api_base_url", client.base_url)
+        api_response_model = cached_api.get("api_response_model")
         print(
             f"[reason api cached] mode={localization_mode} scene={scene_id} "
             f"split={split} localization_id={localization_id}",
             flush=True,
         )
     else:
-        base64_image, upload_image = _encode_image_like_smartgrasp(labeled_image_path)
+        base64_image, upload_image = _encode_original_png(labeled_image_path)
         print(
-            f"[reason upload] jpeg={upload_image['encoded_image_bytes']} bytes "
+            f"[reason upload] png={upload_image['encoded_image_bytes']} bytes "
             f"resolution={upload_image['size'][0]}x{upload_image['size'][1]}",
             flush=True,
         )
         response, api_attempts = _request_chat_completion(
             client,
-            {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": FREEGRASP_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"Grasp {instruction}"},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}",
-                                    "detail": "high",
-                                },
-                            },
-                        ],
-                    },
-                ],
-                "temperature": 0,
-                # The required answer is one short tuple. Keeping the output
-                # budget small reduces relay work without changing the prompt
-                # or the gpt-4o model being evaluated.
-                "max_tokens": 64,
-                "top_p": 1,
-                "frequency_penalty": 0,
-                "presence_penalty": 0,
-                "seed": 0,
-            },
+            _freegrasp_chat_payload(model, instruction, base64_image),
             max_attempts=api_max_attempts,
             retry_backoff_seconds=api_retry_backoff,
         )
@@ -673,6 +749,7 @@ def run_reason_case(
         else:
             status = "ok"
         usage = response.get("usage")
+        api_response_model = response.get("model")
         api_transport = client.transport_name
         api_base_url = client.base_url
 
@@ -686,8 +763,10 @@ def run_reason_case(
                 "split": split,
                 "annotation": instruction,
                 "model": model,
+                "request_profile": FREEGRASP_REQUEST_PROFILE,
                 "api_transport": api_transport,
                 "api_base_url": api_base_url,
+                "api_response_model": api_response_model,
                 "localization_mode": localization_mode,
                 "upload_image": upload_image,
                 "raw_response": raw_response,
@@ -726,13 +805,66 @@ def run_reason_case(
             segmentation_error = repr(exc)
             status = "segmentation_failure"
 
-    metrics = score_prediction_mask(
-        predicted_mask,
-        np.load(scene_dir / "instances_objects.npy"),
-        metadata.get("ground_truth_object_ids"),
-        threshold=iou_threshold,
+    ground_truth_root = (
+        scene_dir.parents[2]
+        / "ground_truth_masks"
+        / metadata["testcase"]
+        / f"scene_{scene_id}"
+        / "gt"
     )
-    metric_status = "ok" if predicted_mask is not None else "algorithm_failure_counted_as_zero"
+    ground_truth_mask_manifest = ground_truth_root / "summary.json"
+    ground_truth_masks = []
+    if ground_truth_mask_manifest.exists():
+        ground_truth_masks = read_json(ground_truth_mask_manifest).get("masks", [])
+
+    has_selected_object_and_mask = (
+        status == "ok"
+        and localization_id is not None
+        and point is not None
+        and point.get("dataset_object_id") is not None
+        and predicted_mask is not None
+    )
+    if compute_metrics and has_selected_object_and_mask:
+        metrics = score_prediction_against_gt_files(
+            predicted_mask,
+            metadata.get("ground_truth_object_ids"),
+            ground_truth_root / "mask",
+            threshold=iou_threshold,
+        )
+        metric_status = "ok"
+        ground_truth_compared = True
+        excluded_from_statistics = False
+    elif compute_metrics:
+        metrics = {
+            "iou": None,
+            "ssr": None,
+            "rsr": None,
+            "iou_threshold": float(iou_threshold),
+            "threshold_operator": ">",
+            "best_ground_truth_object_id": None,
+            "per_ground_truth_iou": {},
+            "compared_ground_truth_masks": [],
+            "metric_definition": (
+                "missing selected object ID or corresponding predicted mask; excluded"
+            ),
+        }
+        metric_status = "missing_selected_object_or_mask_excluded"
+        ground_truth_compared = False
+        excluded_from_statistics = True
+    else:
+        metrics = {
+            "iou": None,
+            "ssr": None,
+            "rsr": None,
+            "iou_threshold": None,
+            "threshold_operator": None,
+            "best_ground_truth_object_id": None,
+            "per_ground_truth_iou": {},
+            "metric_definition": "manual mask comparison; not computed",
+        }
+        metric_status = "manual_review_required"
+        ground_truth_compared = False
+        excluded_from_statistics = True
     payload = {
         "schema_version": 1,
         "testcase": metadata["testcase"],
@@ -743,8 +875,10 @@ def run_reason_case(
         "split": split,
         "annotation": instruction,
         "model": model,
+        "request_profile": FREEGRASP_REQUEST_PROFILE,
         "api_transport": api_transport,
         "api_base_url": api_base_url,
+        "api_response_model": api_response_model,
         "api_attempts": api_attempts,
         "api_cache_reused": api_cache_reused,
         "fresh_run": fresh,
@@ -759,6 +893,12 @@ def run_reason_case(
         "point_x": point["x"] if point else None,
         "point_y": point["y"] if point else None,
         "predicted_mask": str(predicted_mask_path.resolve()) if predicted_mask is not None else None,
+        "ground_truth_object_ids": metadata.get("ground_truth_object_ids"),
+        "ground_truth_mask_manifest": (
+            str(ground_truth_mask_manifest.resolve())
+            if ground_truth_mask_manifest.exists() else None
+        ),
+        "ground_truth_masks": ground_truth_masks,
         "segmentation": segmentation_details,
         "segmentation_error": segmentation_error,
         "localization_result": str(localization_result_path.resolve()),
@@ -769,15 +909,19 @@ def run_reason_case(
         **metrics,
         "metric_status": metric_status,
         "rsr_success": metrics["rsr"],
-        "ground_truth_compared": True,
-        "excluded_from_statistics": False,
+        "ground_truth_compared": ground_truth_compared,
+        "excluded_from_statistics": excluded_from_statistics,
     }
     write_json(result_path, payload)
+    metric_text = (
+        f"ssr={payload['ssr']:.6f} rsr={payload['rsr']}"
+        if payload["ssr"] is not None else f"metrics={metric_status}"
+    )
     print(
         f"[reason done] mode={localization_mode} scene={scene_id} split={split} "
         f"localization_id={localization_id} "
         f"predicted_object_id={payload['predicted_object_id']} status={status} "
-        f"ssr={payload['ssr']:.6f} rsr={payload['rsr']}",
+        f"{metric_text}",
         flush=True,
     )
     return payload
@@ -837,6 +981,7 @@ def write_reports(
         if item.get("failure_type") in {
             "localization_infrastructure_failure",
             "segmentation_infrastructure_failure",
+            "ground_truth_mask_infrastructure_failure",
         }
     ]
 
@@ -866,13 +1011,18 @@ def write_reports(
         ),
         "predicted_object_ids_csv": str(csv_path.resolve()),
         "predicted_object_ids_jsonl": str(jsonl_path.resolve()),
-        "metric_definition": "SSR=max GT IoU; RSR=1 if SSR>0.5 else 0",
-        "threshold_operator": ">",
+        "metric_definition": (
+            "SSR=max GT IoU; RSR=1 if SSR>0.5 else 0"
+            if evaluated else "manual mask comparison; SSR/RSR not computed"
+        ),
+        "threshold_operator": ">" if evaluated else None,
         "api_failure_policy": "timeout/connection/API failure => SSR=null, RSR=null, excluded",
-        "infrastructure_failure_policy": "missing segmentation package/weights => SSR=null, RSR=null, excluded",
-        "algorithm_failure_policy": "valid API response but invalid selection/segmentation => SSR=0, RSR=0, included",
-        "rsr_is_computed": True,
-        "ground_truth_compared": True,
+        "infrastructure_failure_policy": "missing localization/segmentation/GT mask infrastructure => SSR=null, RSR=null, excluded",
+        "selection_or_mask_failure_policy": "missing selected object ID or corresponding predicted mask => SSR=null, RSR=null, excluded",
+        "rsr_is_computed": bool(evaluated),
+        "ground_truth_compared": any(
+            item.get("ground_truth_compared") is True for item in records
+        ),
     }
     write_json(report_root / "summary.json", summary)
     return summary
@@ -880,7 +1030,7 @@ def write_reports(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run FreeGrasp and compute revised mask-IoU SSR/RSR metrics."
+        description="Run FreeGrasp and save masks for manual review by default."
     )
     parser.add_argument("--input-root", type=Path, default=INPUT_ROOT)
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
@@ -910,6 +1060,11 @@ def main() -> None:
     )
     parser.add_argument("--iou-threshold", type=float, default=DEFAULT_IOU_THRESHOLD)
     parser.add_argument(
+        "--manual-mask-review",
+        action="store_true",
+        help="Disable automatic IoU/SSR/RSR and save masks for manual review only.",
+    )
+    parser.add_argument(
         "--localization-mode",
         action="append",
         choices=LOCALIZATION_MODES,
@@ -926,7 +1081,7 @@ def main() -> None:
         "--fresh",
         action="store_true",
         help=(
-            "Recompute localization, GPT-4o reasoning, segmentation, and metrics "
+            "Recompute localization, GPT-4o reasoning, and segmentation "
             "from input without reading or writing intermediate API cache."
         ),
     )
@@ -993,6 +1148,7 @@ def main() -> None:
                             localization_mode=localization_mode,
                             model=args.model,
                             iou_threshold=args.iou_threshold,
+                            compute_metrics=not args.manual_mask_review,
                             force=args.force_reason or args.fresh,
                             fresh=args.fresh,
                             api_max_attempts=args.api_max_attempts,
@@ -1006,10 +1162,14 @@ def main() -> None:
                         is_localization_infrastructure_failure = isinstance(
                             exc, LocalizationInfrastructureError
                         )
+                        is_gt_mask_infrastructure_failure = isinstance(
+                            exc, GroundTruthMaskError
+                        )
                         is_excluded = (
                             is_api_failure
                             or is_segmentation_infrastructure_failure
                             or is_localization_infrastructure_failure
+                            or is_gt_mask_infrastructure_failure
                         )
                         if is_api_failure:
                             failure_type = "api_or_transport_failure"
@@ -1017,6 +1177,8 @@ def main() -> None:
                             failure_type = "localization_infrastructure_failure"
                         elif is_segmentation_infrastructure_failure:
                             failure_type = "segmentation_infrastructure_failure"
+                        elif is_gt_mask_infrastructure_failure:
+                            failure_type = "ground_truth_mask_infrastructure_failure"
                         else:
                             failure_type = "pipeline_failure"
                         failure = {

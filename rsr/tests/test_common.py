@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +9,14 @@ import numpy as np
 from PIL import Image
 
 from rsr.common import parse_bool, parse_freegrasp_response, point_to_dataset_id
-from rsr.run import _encode_image_like_smartgrasp, _save_numbered_png, _visible_instance_point
+from rsr.run import (
+    FREEGRASP_SYSTEM_PROMPT,
+    _encode_original_png,
+    _freegrasp_chat_payload,
+    _save_freegrasp_matplotlib_png,
+    _save_numbered_png,
+    _visible_instance_point,
+)
 
 
 class CommonTests(unittest.TestCase):
@@ -55,16 +63,57 @@ class CommonTests(unittest.TestCase):
                 self.assertEqual(labeled.size, (64, 48))
                 self.assertEqual(labeled.mode, "RGB")
 
-    def test_smartgrasp_image_encoding_is_in_memory_jpeg(self) -> None:
+    def test_original_png_bytes_are_uploaded_without_conversion(self) -> None:
         with TemporaryDirectory() as temporary:
             source = Path(temporary) / "source.png"
             Image.new("RGB", (64, 48), "teal").save(source, format="PNG")
-            encoded, details = _encode_image_like_smartgrasp(source)
-            self.assertTrue(encoded.startswith("/9j/"))
-            self.assertEqual(details["transport_format"], "JPEG")
-            self.assertEqual(details["jpeg_quality"], 90)
+            encoded, details = _encode_original_png(source)
+            self.assertTrue(encoded.startswith("iVBOR"))
+            self.assertEqual(details["transport_format"], "PNG")
             self.assertEqual(details["size"], [64, 48])
-            self.assertFalse(details["persisted_to_disk"])
+            self.assertTrue(details["transport_uses_source_bytes"])
+            self.assertFalse(details["resized"])
+            self.assertFalse(details["recompressed"])
+
+    def test_chat_payload_matches_original_freegrasp_settings(self) -> None:
+        self.assertEqual(len(FREEGRASP_SYSTEM_PROMPT), 1105)
+        self.assertEqual(
+            hashlib.sha256(FREEGRASP_SYSTEM_PROMPT.encode()).hexdigest(),
+            "04b8cdfaee711bafaa126526ef46f470190baf2207e6a736e8419021889f0f77",
+        )
+        payload = _freegrasp_chat_payload("gpt-4o", "the plyer", "PNGDATA")
+        self.assertEqual(payload["model"], "gpt-4o")
+        self.assertEqual(payload["temperature"], 0)
+        self.assertEqual(payload["max_tokens"], 713)
+        self.assertEqual(payload["top_p"], 1)
+        self.assertEqual(payload["frequency_penalty"], 0)
+        self.assertEqual(payload["presence_penalty"], 0)
+        self.assertEqual(payload["seed"], 0)
+        self.assertEqual(
+            payload["messages"][1]["content"][0],
+            {"type": "text", "text": "Grasp the plyer"},
+        )
+        self.assertEqual(
+            payload["messages"][1]["content"][1],
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,PNGDATA"},
+            },
+        )
+
+    def test_freegrasp_matplotlib_prompt_is_high_resolution_rgba_png(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "freegrasp.png"
+            _save_freegrasp_matplotlib_png(
+                Image.new("RGB", (120, 120), "white"),
+                [{"localization_id": 1, "x": 60, "y": 60}],
+                path,
+            )
+            with Image.open(path) as labeled:
+                self.assertEqual(labeled.format, "PNG")
+                self.assertEqual(labeled.mode, "RGBA")
+                self.assertGreater(labeled.size[0], 120)
+                self.assertGreater(labeled.size[1], 120)
 
 
 if __name__ == "__main__":

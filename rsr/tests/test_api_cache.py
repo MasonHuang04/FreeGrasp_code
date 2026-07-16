@@ -5,6 +5,7 @@ import unittest
 from rsr.run import (
     APIRequestError,
     CurlChatClient,
+    FREEGRASP_REQUEST_PROFILE,
     SDKChatClient,
     _api_cache_matches,
     _request_chat_completion,
@@ -29,8 +30,12 @@ class APICacheTests(unittest.TestCase):
             "split": 0,
             "annotation": "yellow plyer",
             "model": "gpt-4o",
+            "request_profile": FREEGRASP_REQUEST_PROFILE,
             "localization_mode": "gt",
-            "upload_image": {"transport_format": "JPEG"},
+            "upload_image": {
+                "transport_format": "PNG",
+                "transport_uses_source_bytes": True,
+            },
             "raw_response": "[2, yellow plyer]",
             "predicted_localization_id": 2,
             "predicted_npz_label": 2,
@@ -58,6 +63,13 @@ class APICacheTests(unittest.TestCase):
 
     def test_changed_model_is_not_reused(self) -> None:
         cached = {**self.cached, "model": "different-model"}
+        self.assertFalse(self.matches(cached))
+
+    def test_old_jpeg_visual_prompt_is_not_reused(self) -> None:
+        cached = {
+            **self.cached,
+            "upload_image": {"transport_format": "JPEG"},
+        }
         self.assertFalse(self.matches(cached))
 
     def test_failed_api_result_is_not_reused(self) -> None:
